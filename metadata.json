@@ -1,0 +1,6 @@
+{
+  "name": "Smart Teleprompter Pro",
+  "description": "Offline native Android teleprompter and CameraX video studio with smooth scrolling, Bengali/Hindi/English support, local TXT/PDF/DOCX import, mirror mode, and Bluetooth remote controls.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
