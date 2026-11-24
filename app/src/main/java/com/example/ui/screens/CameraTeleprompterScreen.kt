@@ -5,7 +5,9 @@ import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.ContentValues
 import android.content.pm.PackageManager
+import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CaptureRequest
+import android.media.CamcorderProfile
 import android.os.Build
 import android.provider.MediaStore
 import android.util.Range
@@ -15,10 +17,12 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.OptIn
+import androidx.camera.camera2.interop.Camera2CameraInfo
 import androidx.camera.camera2.interop.Camera2Interop
 import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
+import androidx.camera.core.DynamicRange
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.video.FallbackStrategy
@@ -244,6 +248,7 @@ fun CameraTeleprompterScreen(
     var torchEnabled by remember { mutableStateOf(false) }
     var hasFlashUnit by remember { mutableStateOf(false) }
     var cameraError by remember { mutableStateOf<String?>(null) }
+    var videoRecordingUnavailableReason by remember { mutableStateOf<String?>(null) }
 
     // Recording State (Independent from script scrolling)
     var isRecording by remember { mutableStateOf(false) }
@@ -299,42 +304,100 @@ fun CameraTeleprompterScreen(
                         }
                     }
 
+                    val cameraInfo = cameraProvider.getCameraInfo(actualSelector)
+                    val camera2Info = Camera2CameraInfo.from(cameraInfo)
+                    val cameraId = camera2Info.cameraId
+
                     val previewBuilder = Preview.Builder()
-                    Camera2Interop.Extender(previewBuilder).setCaptureRequestOption(
-                        CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
-                        Range(fpsOption.fps, fpsOption.fps)
+                    val availableFpsRanges = camera2Info.getCameraCharacteristic(
+                        CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES
                     )
+                    val desiredRange = Range(fpsOption.fps, fpsOption.fps)
+                    if (availableFpsRanges != null &&
+                        availableFpsRanges.any { it.lower == desiredRange.lower && it.upper == desiredRange.upper }
+                    ) {
+                        Camera2Interop.Extender(previewBuilder).setCaptureRequestOption(
+                            CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
+                            desiredRange
+                        )
+                    }
                     val preview = previewBuilder.build().also {
                         it.surfaceProvider = previewView.surfaceProvider
                     }
 
-                    val targetQuality = when (resolutionOption) {
-                        VideoResolutionOption.SD_480 -> Quality.SD
-                        VideoResolutionOption.HD_720 -> Quality.HD
-                        VideoResolutionOption.FHD_1080 -> Quality.FHD
-                        VideoResolutionOption.UHD_4K -> Quality.UHD
+                    // Pre-check hardware EncoderProfiles before invoking Recorder.getVideoCapabilities
+                    // to avoid CapabilitiesByQuality errors on devices/emulators lacking video profiles.
+                    val hasEncoderProfiles = hasHardwareEncoderProfiles(cameraId)
+                    val supportedQualities = if (hasEncoderProfiles) {
+                        runCatching {
+                            Recorder.getVideoCapabilities(cameraInfo)
+                                .getSupportedQualities(DynamicRange.SDR)
+                        }.getOrDefault(emptyList())
+                    } else {
+                        emptyList()
                     }
-                    val qualitySelector = QualitySelector.from(
-                        targetQuality,
-                        FallbackStrategy.lowerQualityOrHigherThan(Quality.SD)
-                    )
-
-                    val recorder = Recorder.Builder()
-                        .setQualitySelector(qualitySelector)
-                        .build()
-                    val capture = VideoCapture.withOutput(recorder)
 
                     cameraProvider.unbindAll()
-                    val camera = cameraProvider.bindToLifecycle(
-                        lifecycleOwner,
-                        actualSelector,
-                        preview,
-                        capture
-                    )
 
-                    boundCamera = camera
-                    videoCapture = capture
-                    hasFlashUnit = camera.cameraInfo.hasFlashUnit()
+                    var boundCapture: VideoCapture<Recorder>? = null
+                    var boundCam: Camera? = null
+
+                    if (supportedQualities.isNotEmpty()) {
+                        val targetQuality = when (resolutionOption) {
+                            VideoResolutionOption.SD_480 -> Quality.SD
+                            VideoResolutionOption.HD_720 -> Quality.HD
+                            VideoResolutionOption.FHD_1080 -> Quality.FHD
+                            VideoResolutionOption.UHD_4K -> Quality.UHD
+                        }
+                        val orderedQualities = buildList {
+                            if (supportedQualities.contains(targetQuality)) add(targetQuality)
+                            supportedQualities.forEach { q -> if (!contains(q)) add(q) }
+                        }
+                        val qualitySelector = QualitySelector.fromOrderedList(
+                            orderedQualities,
+                            FallbackStrategy.lowerQualityOrHigherThan(orderedQualities.first())
+                        )
+                        val recorder = Recorder.Builder()
+                            .setQualitySelector(qualitySelector)
+                            .build()
+                        val capture = VideoCapture.withOutput(recorder)
+
+                        val bindWithVideo = runCatching {
+                            cameraProvider.bindToLifecycle(
+                                lifecycleOwner,
+                                actualSelector,
+                                preview,
+                                capture
+                            )
+                        }
+                        if (bindWithVideo.isSuccess) {
+                            boundCam = bindWithVideo.getOrNull()
+                            boundCapture = capture
+                            videoRecordingUnavailableReason = null
+                        } else {
+                            cameraProvider.unbindAll()
+                            boundCam = cameraProvider.bindToLifecycle(
+                                lifecycleOwner,
+                                actualSelector,
+                                preview
+                            )
+                            videoRecordingUnavailableReason =
+                                "Video recording is unavailable on this camera configuration. Live preview & script overlay remain active."
+                        }
+                    } else {
+                        // Graceful Preview-only fallback when camera lacks hardware video EncoderProfiles
+                        boundCam = cameraProvider.bindToLifecycle(
+                            lifecycleOwner,
+                            actualSelector,
+                            preview
+                        )
+                        videoRecordingUnavailableReason =
+                            "This camera does not report hardware video EncoderProfiles. Live camera preview & teleprompter overlay remain active."
+                    }
+
+                    boundCamera = boundCam
+                    videoCapture = boundCapture
+                    hasFlashUnit = boundCam?.cameraInfo?.hasFlashUnit() == true
                     torchEnabled = false
                     cameraError = null
                 } catch (e: Exception) {
@@ -349,7 +412,11 @@ fun CameraTeleprompterScreen(
     fun beginActualRecording() {
         val capture = videoCapture
         if (capture == null) {
-            scope.launch { snackbarHostState.showSnackbar("Camera is not ready for recording.") }
+            scope.launch {
+                snackbarHostState.showSnackbar(
+                    videoRecordingUnavailableReason ?: "Camera is not ready for video recording."
+                )
+            }
             return
         }
 
@@ -941,6 +1008,13 @@ fun CameraTeleprompterScreen(
                                     activeRecording?.stop()
                                 } else if (activeCountdown > 0) {
                                     activeCountdown = 0
+                                } else if (videoCapture == null) {
+                                    scope.launch {
+                                        snackbarHostState.showSnackbar(
+                                            videoRecordingUnavailableReason
+                                                ?: "Video recording is unavailable on this camera."
+                                        )
+                                    }
                                 } else if (countdownSeconds > 0) {
                                     activeCountdown = countdownSeconds
                                 } else {
@@ -1123,3 +1197,28 @@ fun CameraTeleprompterScreen(
         }
     }
 }
+
+private fun hasHardwareEncoderProfiles(cameraId: String): Boolean {
+    val standardQualities = intArrayOf(
+        CamcorderProfile.QUALITY_2160P,
+        CamcorderProfile.QUALITY_1080P,
+        CamcorderProfile.QUALITY_720P,
+        CamcorderProfile.QUALITY_480P,
+        CamcorderProfile.QUALITY_HIGH,
+        CamcorderProfile.QUALITY_LOW
+    )
+    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        standardQualities.any { quality ->
+            runCatching {
+                val profiles = CamcorderProfile.getAll(cameraId, quality)
+                profiles != null && profiles.videoProfiles.isNotEmpty()
+            }.getOrDefault(false)
+        }
+    } else {
+        val idInt = cameraId.toIntOrNull() ?: return false
+        standardQualities.any { quality ->
+            runCatching { CamcorderProfile.hasProfile(idInt, quality) }.getOrDefault(false)
+        }
+    }
+}
+
